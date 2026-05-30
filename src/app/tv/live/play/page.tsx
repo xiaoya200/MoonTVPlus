@@ -14,10 +14,13 @@ type LiveChannel = { id: string; tvgId?: string; name: string; logo?: string; gr
 type EpgProgram = { start: string; end: string; title: string };
 type TVPlayerSourceType = 'm3u8' | 'flv' | 'native';
 
+const TV_LIVE_LAST_CHANNEL_KEY = 'tv_live_last_channel';
+const REMOTE_KEY_DEDUPE_MS = 350;
+
 function getLogoUrl(logo?: string, source?: string) {
   if (!logo) return '';
-  if (!source) return logo;
-  return `/api/proxy/logo?url=${encodeURIComponent(logo)}&source=${encodeURIComponent(source)}`;
+  const sourceParam = source ? `&source=${encodeURIComponent(source)}` : '';
+  return `/api/proxy/logo?url=${encodeURIComponent(logo)}${sourceParam}`;
 }
 
 function getUrlSourceType(rawUrl: string): TVPlayerSourceType | 'unknown' {
@@ -38,7 +41,7 @@ async function resolveLiveUrl(rawUrl: string, source?: LiveSource | null): Promi
       type: 'm3u8',
       url: proxyMode === 'direct'
         ? rawUrl
-        : `/api/proxy/m3u8?url=${encodeURIComponent(rawUrl)}&moontv-source=${encodeURIComponent(source?.key || '')}`,
+        : `/api/proxy/m3u8?url=${encodeURIComponent(rawUrl)}&moontv-source=${encodeURIComponent(source?.key || '')}${proxyMode === 'm3u8-only' ? '&allowCORS=true' : ''}`,
     };
   }
   if (sourceType === 'flv') return { type: 'flv', url: rawUrl };
@@ -60,7 +63,7 @@ async function resolveLiveUrl(rawUrl: string, source?: LiveSource | null): Promi
       type: 'm3u8',
       url: proxyMode === 'direct'
         ? rawUrl
-        : `/api/proxy/m3u8?url=${encodeURIComponent(rawUrl)}&moontv-source=${encodeURIComponent(source.key)}`,
+        : `/api/proxy/m3u8?url=${encodeURIComponent(rawUrl)}&moontv-source=${encodeURIComponent(source.key)}${proxyMode === 'm3u8-only' ? '&allowCORS=true' : ''}`,
     };
   }
 
@@ -82,7 +85,7 @@ function TVLivePlayClient() {
   const [unsupportedError, setUnsupportedError] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [showPanel, setShowPanel] = useState(true);
+  const [showPanel, setShowPanel] = useState(false);
   const [selectedGroup, setSelectedGroup] = useState('');
   const [query, setQuery] = useState('');
   const [digitBuffer, setDigitBuffer] = useState('');
@@ -93,8 +96,14 @@ function TVLivePlayClient() {
   const [epgLoading, setEpgLoading] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
+  const [showVolumeHint, setShowVolumeHint] = useState(false);
+  const [channelHint, setChannelHint] = useState<{ number: number; name: string } | null>(null);
   const channelButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const digitTimerRef = useRef<number | null>(null);
+  const volumeHintTimerRef = useRef<number | null>(null);
+  const channelHintTimerRef = useRef<number | null>(null);
+  const menuKeyTimeRef = useRef(0);
+  const backKeyTimeRef = useRef(0);
 
   useEffect(() => {
     let alive = true;
@@ -195,6 +204,26 @@ function TVLivePlayClient() {
   }, [channel?.tvgId, source]);
 
   useEffect(() => {
+    if (!source || !channel) return;
+    try {
+      localStorage.setItem(
+        TV_LIVE_LAST_CHANNEL_KEY,
+        JSON.stringify({
+          source: source.key,
+          sourceName: source.name,
+          id: channel.id,
+          title: channel.name,
+          group: channel.group || '',
+          logo: channel.logo || '',
+          updatedAt: Date.now(),
+        })
+      );
+    } catch {
+      // ignore storage failures
+    }
+  }, [channel, source]);
+
+  useEffect(() => {
     if (!playbackError || !channel || retryCount >= 3) return;
     const timer = window.setTimeout(() => {
       setRetryCount((value) => value + 1);
@@ -231,12 +260,15 @@ function TVLivePlayClient() {
     }
   };
 
-  const switchChannel = (next: LiveChannel) => {
+  const switchChannel = (next: LiveChannel, revealControls = true) => {
     precheckChannel(next);
     setChannel(next);
     setSelectedGroup(next.group || '其他');
-    setShowPanel(true);
-    if (source) router.replace(`/tv/live/play?source=${encodeURIComponent(source.key)}&id=${encodeURIComponent(next.id)}`);
+    if (revealControls) setShowPanel(true);
+    const number = channels.findIndex((item) => item.id === next.id) + 1;
+    setChannelHint({ number: number > 0 ? number : 1, name: next.name });
+    if (channelHintTimerRef.current) window.clearTimeout(channelHintTimerRef.current);
+    channelHintTimerRef.current = window.setTimeout(() => setChannelHint(null), 5000);
   };
 
   const switchSource = (next: LiveSource) => {
@@ -278,6 +310,9 @@ function TVLivePlayClient() {
     }
     setVolume(safe);
     setMuted(safe <= 0);
+    setShowVolumeHint(true);
+    if (volumeHintTimerRef.current) window.clearTimeout(volumeHintTimerRef.current);
+    volumeHintTimerRef.current = window.setTimeout(() => setShowVolumeHint(false), 1200);
   };
 
   const toggleMute = () => {
@@ -305,7 +340,31 @@ function TVLivePlayClient() {
   }, [muted, videoUrl, volume]);
 
   useEffect(() => {
+    const togglePanelByRemoteKey = (event: { preventDefault: () => void }) => {
+      const now = Date.now();
+      if (now - menuKeyTimeRef.current < REMOTE_KEY_DEDUPE_MS) return;
+      menuKeyTimeRef.current = now;
+      event.preventDefault();
+      setShowPanel((value) => !value);
+    };
+
     const onKey = (event: KeyboardEvent) => {
+      const isMenuKey =
+        event.key === 'ContextMenu' ||
+        event.key === 'Menu' ||
+        event.key === 'BrowserContextMenu' ||
+        event.code === 'ContextMenu' ||
+        event.code === 'Menu' ||
+        event.keyCode === 93 ||
+        event.keyCode === 82;
+      if (isMenuKey) {
+        event.stopImmediatePropagation();
+        togglePanelByRemoteKey(event);
+        return;
+      }
+
+      if (event.type === 'keyup') return;
+
       if (/^[0-9]$/.test(event.key) && channels.length) {
         event.preventDefault();
         const nextBuffer = `${digitBuffer}${event.key}`.slice(-4);
@@ -321,15 +380,47 @@ function TVLivePlayClient() {
       if (event.key === 'Enter') {
         const active = document.activeElement;
         const isControlFocused = active instanceof HTMLElement && Boolean(active.closest('[data-tv-live-control]'));
+        if (!showPanel) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          setShowPanel(true);
+          return;
+        }
         if (!isControlFocused) {
           event.preventDefault();
+          event.stopImmediatePropagation();
           setShowPanel((v) => !v);
+          return;
         }
+      }
+      if (!showPanel && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const currentIndex = channels.findIndex((item) => item.id === channel?.id);
+        if (currentIndex >= 0) {
+          const nextIndex = event.key === 'ArrowUp' ? currentIndex - 1 : currentIndex + 1;
+          const next = channels[Math.max(0, Math.min(channels.length - 1, nextIndex))];
+          if (next && next.id !== channel?.id) switchChannel(next, false);
+        }
+        return;
+      }
+      if (!showPanel && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setVideoVolume(volume + (event.key === 'ArrowRight' ? 0.05 : -0.05));
+        return;
       }
       if (event.key === 'Escape') {
         event.preventDefault();
-        if (showPanel) setShowPanel(false);
-        else router.back();
+        event.stopImmediatePropagation();
+        const now = Date.now();
+        if (showPanel) {
+          backKeyTimeRef.current = now;
+          setShowPanel(false);
+        } else if (now - backKeyTimeRef.current >= 250) {
+          router.back();
+        }
+        return;
       }
       if (event.key === 'PageUp' || event.key === 'PageDown') {
         const currentIndex = channels.findIndex((item) => item.id === channel?.id);
@@ -340,9 +431,13 @@ function TVLivePlayClient() {
         }
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [channel?.id, channels, digitBuffer, router, showPanel, source]);
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('keyup', onKey, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('keyup', onKey, true);
+    };
+  }, [channel?.id, channels, digitBuffer, router, showPanel, source, volume]);
 
   useEffect(() => {
     if (!showPanel || !channel?.id) return;
@@ -372,7 +467,18 @@ function TVLivePlayClient() {
   }
 
   return (
-    <main data-tv-player-root className='fixed inset-0 overflow-hidden bg-black text-white' onMouseMove={() => setShowPanel(true)}>
+    <main
+      data-tv-player-root
+      data-tv-controls-open={showPanel ? 'true' : 'false'}
+      className='fixed inset-0 overflow-hidden bg-black text-white'
+      onContextMenu={(event) => {
+        const now = Date.now();
+        if (now - menuKeyTimeRef.current < REMOTE_KEY_DEDUPE_MS) return;
+        menuKeyTimeRef.current = now;
+        event.preventDefault();
+        setShowPanel((value) => !value);
+      }}
+    >
       {unsupportedError ? (
         <div role='alert' className='flex h-full items-center justify-center bg-black p-10 text-center text-white'>
           <section className='max-w-3xl rounded-[36px] border border-amber-500/40 bg-slate-950/92 p-9 shadow-2xl shadow-black/70'>
@@ -404,7 +510,7 @@ function TVLivePlayClient() {
       </div>
 
       <div className={`absolute left-8 right-8 top-8 flex items-center justify-between transition-opacity duration-300 ${showPanel ? 'opacity-100' : 'opacity-0'}`}>
-        <button onClick={() => router.back()} data-tv-live-control className='tv-focusable flex cursor-pointer items-center gap-3 rounded-2xl bg-black/70 px-5 py-4 text-2xl font-black outline-none backdrop-blur focus:ring-4 focus:ring-rose-300'><ArrowLeft className='h-7 w-7' />返回</button>
+        <button onClick={() => { if (showPanel) setShowPanel(false); else router.back(); }} data-tv-live-control className='tv-focusable flex cursor-pointer items-center gap-3 rounded-2xl bg-black/70 px-5 py-4 text-2xl font-black outline-none backdrop-blur focus:ring-4 focus:ring-rose-300'><ArrowLeft className='h-7 w-7' />返回</button>
         <div className='flex items-center gap-4 rounded-2xl bg-black/70 px-6 py-4 backdrop-blur'>
           {channel.logo ? <img src={getLogoUrl(channel.logo, source?.key)} alt='' className='h-12 w-12 rounded-xl object-contain' /> : <Radio className='h-10 w-10 text-rose-500' />}
           <div><div className='text-3xl font-black'>{channel.name}</div><div className='text-xl text-slate-300'>{source?.name} · {channel.group}</div></div>
@@ -419,21 +525,21 @@ function TVLivePlayClient() {
 
       {showPanel && (
         <aside data-tv-live-control className='absolute bottom-8 left-8 top-28 grid w-[720px] grid-cols-[220px_1fr] gap-4 rounded-[34px] border border-white/10 bg-slate-950/88 p-5 shadow-2xl shadow-black/70 backdrop-blur-2xl'>
-          <div className='overflow-y-auto pr-2'>
+          <div className='overflow-y-auto px-2 py-2'>
             {sources.length > 1 && (
               <>
                 <h2 className='mb-3 text-2xl font-black'>直播源</h2>
                 <div className='mb-5 space-y-3'>
-                  {sources.map((item) => <button key={item.key} onClick={() => switchSource(item)} className={`tv-focusable w-full cursor-pointer rounded-2xl px-4 py-4 text-left text-xl font-black outline-none focus:ring-4 focus:ring-rose-300 ${source?.key === item.key ? 'bg-rose-600' : 'bg-white/10'}`}>{item.name}</button>)}
+                  {sources.map((item) => <button key={item.key} onClick={() => switchSource(item)} className={`tv-focusable w-full cursor-pointer rounded-2xl px-4 py-4 text-left text-xl font-black outline-none focus:ring-4 focus:ring-inset focus:ring-rose-300 ${source?.key === item.key ? 'bg-rose-600' : 'bg-white/10'}`}>{item.name}</button>)}
                 </div>
               </>
             )}
             <h2 className='mb-4 text-2xl font-black'>分类</h2>
             <div className='space-y-3'>
-              {groups.map((group) => <button key={group} onClick={() => setSelectedGroup(group)} className={`tv-focusable w-full cursor-pointer rounded-2xl px-4 py-4 text-left text-xl font-black outline-none focus:ring-4 focus:ring-rose-300 ${selectedGroup === group ? 'bg-rose-600' : 'bg-white/10'}`}>{group}</button>)}
+              {groups.map((group) => <button key={group} onClick={() => setSelectedGroup(group)} className={`tv-focusable w-full cursor-pointer rounded-2xl px-4 py-4 text-left text-xl font-black outline-none focus:ring-4 focus:ring-inset focus:ring-rose-300 ${selectedGroup === group ? 'bg-rose-600' : 'bg-white/10'}`}>{group}</button>)}
             </div>
           </div>
-          <div className='overflow-y-auto pr-2'>
+          <div className='overflow-y-auto px-2 py-2'>
             <h2 className='mb-4 flex items-center gap-2 text-2xl font-black'><Star className='h-6 w-6 text-rose-500' />频道</h2>
             <section className='mb-4 rounded-2xl bg-white/[0.06] p-4'>
               <h3 className='mb-3 flex items-center gap-2 text-xl font-black text-slate-100'><Clock className='h-5 w-5 text-rose-400' />节目单</h3>
@@ -450,13 +556,28 @@ function TVLivePlayClient() {
             <div className='grid grid-cols-1 gap-3'>
               {filteredChannels.map((item) => {
                 const absoluteIndex = channels.findIndex((c) => c.id === item.id) + 1;
-                return <button key={item.id} ref={(el) => { channelButtonRefs.current[item.id] = el; }} onClick={() => switchChannel(item)} className={`tv-focusable flex min-h-16 cursor-pointer items-center gap-3 rounded-2xl px-4 py-3 text-left text-xl font-black outline-none focus:ring-4 focus:ring-rose-300 ${item.id === channel.id ? 'bg-rose-600' : 'bg-white/10'}`}>{item.logo ? <img src={getLogoUrl(item.logo, source?.key)} alt='' className='h-9 w-9 rounded-lg object-contain' /> : <Radio className='h-8 w-8 text-rose-400' />}<span className='min-w-12 text-slate-300'>#{absoluteIndex}</span><span className='line-clamp-1'>{item.name}</span></button>;
+                return <button key={item.id} ref={(el) => { channelButtonRefs.current[item.id] = el; }} onClick={() => switchChannel(item)} className={`tv-focusable flex min-h-16 cursor-pointer items-center gap-3 rounded-2xl px-4 py-3 text-left text-xl font-black outline-none focus:ring-4 focus:ring-inset focus:ring-rose-300 ${item.id === channel.id ? 'bg-rose-600' : 'bg-white/10'}`}>{item.logo ? <img src={getLogoUrl(item.logo, source?.key)} alt='' className='h-9 w-9 rounded-lg object-contain' /> : <Radio className='h-8 w-8 text-rose-400' />}<span className='min-w-12 text-slate-300'>#{absoluteIndex}</span><span className='line-clamp-1'>{item.name}</span></button>;
               })}
             </div>
           </div>
         </aside>
       )}
       {digitBuffer && <div className='absolute right-10 top-32 rounded-3xl bg-black/75 px-7 py-5 text-5xl font-black text-white shadow-2xl'>频道 {digitBuffer}</div>}
+      {channelHint && (
+        <div className='absolute right-20 top-24 max-w-[520px] rounded-3xl bg-black/80 px-7 py-5 text-right text-white shadow-2xl backdrop-blur'>
+          <div className='text-2xl font-black text-rose-200'>#{channelHint.number}</div>
+          <div className='mt-1 line-clamp-1 text-4xl font-black'>{channelHint.name}</div>
+        </div>
+      )}
+      {showVolumeHint && !showPanel && (
+        <div className='absolute right-10 top-1/2 flex -translate-y-1/2 flex-col items-center gap-4 rounded-3xl bg-black/80 px-6 py-7 text-3xl font-black text-white shadow-2xl backdrop-blur'>
+          {muted || volume <= 0 ? <VolumeX className='h-10 w-10' /> : <Volume2 className='h-10 w-10' />}
+          <div className='relative h-56 w-4 overflow-hidden rounded-full bg-white/20'>
+            <div className='absolute bottom-0 left-0 right-0 rounded-full bg-rose-600' style={{ height: `${Math.round((muted ? 0 : volume) * 100)}%` }} />
+          </div>
+          <div className='min-w-16 text-center'>{Math.round((muted ? 0 : volume) * 100)}</div>
+        </div>
+      )}
       <TVVirtualRemote />
     </main>
   );

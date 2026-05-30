@@ -44,6 +44,53 @@ function getFocusableElements() {
     .filter(isVisible);
 }
 
+function getScrollableParent(element: HTMLElement) {
+  let current = element.parentElement;
+  while (current && current !== document.body) {
+    const style = window.getComputedStyle(current);
+    const canScrollY = /(auto|scroll)/.test(style.overflowY) && current.scrollHeight > current.clientHeight;
+    const canScrollX = /(auto|scroll)/.test(style.overflowX) && current.scrollWidth > current.clientWidth;
+    if (canScrollY || canScrollX) return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function scrollIntoScrollableParent(element: HTMLElement) {
+  const parent = getScrollableParent(element);
+  if (!parent) return false;
+
+  const elementRect = element.getBoundingClientRect();
+  const parentRect = parent.getBoundingClientRect();
+  const padding = 16;
+
+  if (elementRect.top < parentRect.top + padding) {
+    parent.scrollBy({
+      top: elementRect.top - parentRect.top - padding,
+      behavior: 'smooth',
+    });
+  } else if (elementRect.bottom > parentRect.bottom - padding) {
+    parent.scrollBy({
+      top: elementRect.bottom - parentRect.bottom + padding,
+      behavior: 'smooth',
+    });
+  }
+
+  if (elementRect.left < parentRect.left + padding) {
+    parent.scrollBy({
+      left: elementRect.left - parentRect.left - padding,
+      behavior: 'smooth',
+    });
+  } else if (elementRect.right > parentRect.right - padding) {
+    parent.scrollBy({
+      left: elementRect.right - parentRect.right + padding,
+      behavior: 'smooth',
+    });
+  }
+
+  return true;
+}
+
 function focusElement(element: HTMLElement) {
   element.focus({ preventScroll: true });
 
@@ -67,6 +114,8 @@ function focusElement(element: HTMLElement) {
         window.scrollBy({ top: rect.bottom - safeBottom, behavior: 'smooth' });
       }
     });
+  } else {
+    scrollIntoScrollableParent(element);
   }
 }
 
